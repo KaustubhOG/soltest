@@ -1,5 +1,9 @@
 # soltest
 Generate Anchor tests from IDL. One command. No boilerplate.
+
+
+## Project Structure
+```
 soltest/
 ├── bin/
 │   └── soltest.js          # CLI entry (npx soltest)
@@ -22,3 +26,4 @@ soltest/
 ├── tsconfig.json
 ├── README.md
 └── LICENSE
+```
