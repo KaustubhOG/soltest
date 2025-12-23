@@ -1,6 +1,9 @@
 {
   "name": "soltest",
   "version": "1.0.0",
+  "bin": {
+    "soltest": "./bin/soltest.js"
+  },
   "description": "Generate Anchor tests from IDL. One command. No boilerplate.",
   "main": "index.js",
   "scripts": {
@@ -17,5 +20,8 @@
   "bugs": {
     "url": "https://github.com/KaustubhOG/soltest/issues"
   },
-  "homepage": "https://github.com/KaustubhOG/soltest#readme"
+  "homepage": "https://github.com/KaustubhOG/soltest#readme",
+  "devDependencies": {
+    "@types/node": "^25.0.3"
+  }
 }
