@@ -11,14 +11,16 @@ if (!fs.existsSync(idlDir)) {
   process.exit(1);
 }
 
-const files = fs.readdirSync(idlDir).filter(f => f.endsWith(".json"));
+const files = fs.readdirSync(idlDir).filter((f) => f.endsWith(".json"));
 
 if (files.length === 0) {
-  console.error("❌No IDL files found");
+  console.error("No IDL files found");
   process.exit(1);
 }
 
 const idlPath = path.join(idlDir, files[0]);
 const idl = JSON.parse(fs.readFileSync(idlPath, "utf-8"));
 
-console.log(" Program name:", idl.name);
+const programName = path.basename(files[0], ".json");
+
+console.log(" Program name:", programName);
