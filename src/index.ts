@@ -70,3 +70,43 @@ if (signerAccounts.length === 0) {
 }
 
 console.log("Primary signer for tests:", primarySigner);
+// : account classification ----
+
+const PROGRAM_ACCOUNTS = new Set([
+  "system_program",
+  "token_program",
+  "token_2022_program",
+  "associated_token_program",
+  "rent",
+]);
+
+type AccountKind = "program" | "signer" | "pda" | "user";
+
+const classifiedAccounts = ix.accounts.map((acc: any) => {
+  let kind: AccountKind = "user";
+
+  if (PROGRAM_ACCOUNTS.has(acc.name)) {
+    kind = "program";
+  } else if (acc.isSigner) {
+    kind = "signer";
+  } else if (!acc.isSigner) {
+    // MVP assumption: non-signer, non-program accounts are PDAs
+    kind = "pda";
+  }
+
+  return {
+    name: acc.name,
+    kind,
+    isMut: acc.isMut,
+  };
+});
+
+console.log("Account classification:");
+classifiedAccounts.forEach((acc) => {
+  const flags = [];
+  if (acc.isMut) flags.push("mut");
+
+  console.log(
+    `- ${acc.name} → ${acc.kind}${flags.length ? " (" + flags.join(", ") + ")" : ""}`
+  );
+});
