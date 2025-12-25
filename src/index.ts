@@ -48,3 +48,25 @@ console.log("Args:");
 ix.args.forEach((arg: any) => {
   console.log(`- ${arg.name}: ${arg.type}`);
 });
+// ---- Part 4: signer detection ----
+
+const signerAccounts = ix.accounts.filter((acc: any) => acc.isSigner);
+
+let primarySigner: string;
+
+if (signerAccounts.length === 0) {
+  primarySigner = "provider.wallet (default)";
+} else {
+  primarySigner = signerAccounts[0].name;
+}
+
+console.log("Signer accounts:");
+if (signerAccounts.length === 0) {
+  console.log("- none (using provider.wallet)");
+} else {
+  signerAccounts.forEach((acc: any) => {
+    console.log(`- ${acc.name}`);
+  });
+}
+
+console.log("Primary signer for tests:", primarySigner);
