@@ -1,0 +1,2489 @@
+import fs from "fs";
+import path from "path";
+import readline from "readline";
+
+// Types
+interface Seed {
+  kind: "const" | "account" | "arg";
+  value?: number[] | string;
+  path?: string;
+}
+
+interface Account {
+  name: string;
+  writable?: boolean;
+  signer?: boolean;
+  pda?: { seeds: Seed[] };
+  address?: string;
+}
+
+interface Arg {
+  name: string;
+  type: string | { kind: string };
+}
+
+interface Instruction {
+  name: string;
+  accounts: Account[];
+  args: Arg[];
+}
+
+interface IDL {
+  instructions: Instruction[];
+  metadata?: { name: string };
+}
+
+interface SetupInstruction {
+  instruction: Instruction;
+  methodName: string;
+  args: Map<string, string>;
+  pdas: string[];
+}
+
+// Utilities
+const toCamelCase = (s: string): string =>
+  s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+
+const toTitleCase = (s: string): string =>
+  s.charAt(0).toUpperCase() + s.slice(1);
+
+// Seed processor
+class SeedProcessor {
+  processSeeds(
+    seeds: Seed[],
+    args: Arg[]
+  ): {
+    expressions: string[];
+    usesArgs: boolean;
+  } {
+    const expressions: string[] = [];
+    let usesArgs = false;
+
+    for (const seed of seeds) {
+      if (seed.kind === "const" && Array.isArray(seed.value)) {
+        expressions.push(`Buffer.from([${seed.value.join(", ")}])`);
+      } else if (seed.kind === "account") {
+        expressions.push("provider.wallet.publicKey.toBuffer()");
+      } else if (seed.kind === "arg") {
+        const arg = args.find(
+          (a) => a.name === seed.path || a.name === `_${seed.path}`
+        );
+        if (arg) {
+          const varName = arg.name.startsWith("_")
+            ? arg.name.slice(1)
+            : arg.name;
+          const argType =
+            typeof arg.type === "string" ? arg.type : arg.type.kind;
+
+          if (argType === "u64" || argType === "i64") {
+            expressions.push(
+              `Buffer.from(${varName}.toArrayLike(Buffer, "le", 8))`
+            );
+          } else if (argType === "string") {
+            expressions.push(`Buffer.from(${varName})`);
+          }
+          usesArgs = true;
+        }
+      }
+    }
+
+    return { expressions, usesArgs };
+  }
+}
+
+// Instruction analyzer
+class InstructionAnalyzer {
+  categorize(
+    instruction: Instruction
+  ): "create" | "modify" | "delete" | "other" {
+    const name = instruction.name.toLowerCase();
+
+    if (
+      name.includes("init") ||
+      name.includes("create") ||
+      name.includes("add")
+    ) {
+      const createsPDA = instruction.accounts.some(
+        (acc) =>
+          acc.pda && acc.writable && !this.isExternalReference(acc, instruction)
+      );
+      if (createsPDA) return "create";
+    }
+
+    if (name.includes("update")) return "modify";
+    if (name.includes("delete") || name.includes("close")) return "delete";
+
+    const hasExternalPDA = instruction.accounts.some(
+      (acc) => acc.pda && this.isExternalReference(acc, instruction)
+    );
+
+    if (hasExternalPDA) return "modify";
+
+    return "other";
+  }
+
+  private isExternalReference(
+    account: Account,
+    instruction: Instruction
+  ): boolean {
+    if (!account.pda) return false;
+
+    for (const seed of account.pda.seeds) {
+      if (seed.kind === "arg") {
+        const argExists = instruction.args.some(
+          (a) => a.name === seed.path || a.name === `_${seed.path}`
+        );
+        if (!argExists) return true;
+      }
+    }
+
+    return false;
+  }
+
+  findDependencies(
+    instruction: Instruction,
+    allInstructions: Instruction[]
+  ): Instruction[] {
+    const deps: Instruction[] = [];
+    const category = this.categorize(instruction);
+
+    // Check for PDA dependencies (for non-create instructions)
+    if (category !== "create") {
+      for (const acc of instruction.accounts) {
+        if (!acc.pda) continue;
+
+        for (const otherIx of allInstructions) {
+          if (otherIx.name === instruction.name) continue;
+
+          const otherCategory = this.categorize(otherIx);
+          if (otherCategory === "create") {
+            const createsCompatiblePDA = otherIx.accounts.some(
+              (otherAcc) =>
+                otherAcc.pda &&
+                this.arePDAsCompatible(acc, otherAcc, instruction, otherIx)
+            );
+
+            if (createsCompatiblePDA && !deps.includes(otherIx)) {
+              deps.push(otherIx);
+            }
+          }
+        }
+      }
+    }
+
+    // Check for non-PDA account references (for ALL instructions including creates)
+    for (const acc of instruction.accounts) {
+      // Skip PDAs, signers, system program, and accounts with addresses
+      if (acc.pda || acc.signer || acc.address || acc.name === "system_program")
+        continue;
+
+      // Look for create instructions that produce a PDA with matching name
+      for (const otherIx of allInstructions) {
+        if (otherIx.name === instruction.name) continue;
+
+        const otherCategory = this.categorize(otherIx);
+        if (otherCategory === "create") {
+          const createsPDAWithSameName = otherIx.accounts.some(
+            (otherAcc) =>
+              otherAcc.pda && otherAcc.writable && otherAcc.name === acc.name
+          );
+
+          if (createsPDAWithSameName && !deps.includes(otherIx)) {
+            deps.push(otherIx);
+          }
+        }
+      }
+    }
+
+    return deps;
+  }
+
+  private arePDAsCompatible(
+    acc1: Account,
+    acc2: Account,
+    ix1: Instruction,
+    ix2: Instruction
+  ): boolean {
+    if (!acc1.pda || !acc2.pda) return false;
+
+    const seeds1 = acc1.pda.seeds;
+    const seeds2 = acc2.pda.seeds;
+
+    if (seeds1.length !== seeds2.length) return false;
+
+    for (let i = 0; i < seeds1.length; i++) {
+      const s1 = seeds1[i];
+      const s2 = seeds2[i];
+
+      if (s1.kind !== s2.kind) return false;
+
+      if (s1.kind === "const") {
+        if (JSON.stringify(s1.value) !== JSON.stringify(s2.value)) return false;
+      }
+    }
+
+    return true;
+  }
+}
+
+// Test generator
+class TestGenerator {
+  private seedProcessor = new SeedProcessor();
+  private analyzer = new InstructionAnalyzer();
+
+  generate(idl: IDL, programName: string): string {
+    const instructions = this.selectInstructions(idl.instructions);
+
+    const setupMap = new Map<string, SetupInstruction[]>();
+    let debugInfo = "/* DEBUG INFO:\n";
+
+    for (const ix of instructions) {
+      const deps = this.analyzer.findDependencies(ix, instructions);
+      debugInfo += `\nInstruction: ${ix.name}\n`;
+      debugInfo += `  Category: ${this.analyzer.categorize(ix)}\n`;
+      debugInfo += `  Accounts: ${ix.accounts
+        .map((a) => `${a.name}(pda:${!!a.pda},writable:${!!a.writable})`)
+        .join(", ")}\n`;
+      debugInfo += `  Dependencies: ${
+        deps.length > 0 ? deps.map((d) => d.name).join(", ") : "NONE"
+      }\n`;
+
+      if (deps.length > 0) {
+        setupMap.set(
+          ix.name,
+          deps.map((dep) => this.buildSetupInstruction(dep))
+        );
+      }
+    }
+    debugInfo += "*/\n\n";
+
+    const scopePDAs = this.generateAllScopePDAs(instructions);
+    const scopePDANames = new Set(
+      scopePDAs
+        .map((pda) => {
+          const match = pda.match(/const \[(\w+)Pda\]/);
+          return match ? match[1] : "";
+        })
+        .filter(Boolean)
+    );
+
+    const allTests: string[] = [];
+    let testCounter = 1;
+
+    for (const instruction of instructions) {
+      const setup = setupMap.get(instruction.name) || [];
+      const tests = this.generateInstructionTests(
+        instruction,
+        setup,
+        scopePDANames,
+        testCounter
+      );
+      allTests.push(tests);
+      testCounter += 3;
+    }
+
+    return this.wrapTests(programName, allTests, scopePDAs, debugInfo);
+  }
+
+  private selectInstructions(instructions: Instruction[]): Instruction[] {
+    const scored = instructions.map((ix) => {
+      let score = 0;
+      const name = ix.name.toLowerCase();
+
+      if (name.includes("init") || name.includes("create")) score -= 10;
+      if (name.includes("update")) score -= 5;
+      if (name.includes("delete")) score -= 3;
+
+      for (const acc of ix.accounts) {
+        if (!acc.pda && !acc.signer && !acc.address) score += 5;
+      }
+
+      return { instruction: ix, score };
+    });
+
+    scored.sort((a, b) => a.score - b.score);
+    return scored
+      .slice(0, Math.min(3, instructions.length))
+      .map((s) => s.instruction);
+  }
+
+  private buildSetupInstruction(instruction: Instruction): SetupInstruction {
+    const args = new Map<string, string>();
+
+    for (const arg of instruction.args) {
+      const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+      args.set(varName, this.generateArgValue(arg, "success", 1));
+    }
+
+    const pdas: string[] = [];
+    for (const acc of instruction.accounts) {
+      if (acc.pda) {
+        const result = this.seedProcessor.processSeeds(
+          acc.pda.seeds,
+          instruction.args
+        );
+        if (!result.usesArgs) {
+          pdas.push(acc.name);
+        }
+      }
+    }
+
+    return {
+      instruction,
+      methodName: toCamelCase(instruction.name),
+      args,
+      pdas,
+    };
+  }
+
+  private generateAllScopePDAs(instructions: Instruction[]): string[] {
+    const pdas: string[] = [];
+    const seen = new Set<string>();
+
+    for (const ix of instructions) {
+      for (const acc of ix.accounts) {
+        if (!acc.pda) continue;
+
+        const result = this.seedProcessor.processSeeds(acc.pda.seeds, ix.args);
+
+        if (!result.usesArgs && !seen.has(acc.name)) {
+          seen.add(acc.name);
+          const seedsCode = result.expressions
+            .map((e) => `      ${e}`)
+            .join(",\n");
+          pdas.push(
+            `  const [${acc.name}Pda] = anchor.web3.PublicKey.findProgramAddressSync(\n` +
+              `    [\n${seedsCode}\n    ],\n` +
+              `    program.programId\n` +
+              `  );`
+          );
+        }
+      }
+    }
+
+    return pdas;
+  }
+
+  private generateInstructionTests(
+    instruction: Instruction,
+    setupInstructions: SetupInstruction[],
+    scopePDANames: Set<string>,
+    baseTestCounter: number
+  ): string {
+    const methodName = toCamelCase(instruction.name);
+    const action = this.getAction(instruction.name);
+    const subject = this.getSubject(instruction.name);
+
+    const tests: string[] = [];
+
+    for (let i = 0; i < 3; i++) {
+      const testCounter = baseTestCounter + i;
+      const testCase = i === 0 ? "success" : i === 2 ? "edge" : "success";
+      const shouldFail = i === 1;
+
+      const setupCode = this.generateSetupCode(
+        setupInstructions,
+        scopePDANames,
+        testCounter
+      );
+      const setupPDANames = this.extractSetupPDAs(setupCode);
+      const setupPDAMap = this.buildSetupPDAMap(setupInstructions);
+
+      const testPDAs = this.generateTestLevelPDAs(
+        instruction,
+        scopePDANames,
+        setupPDANames,
+        testCounter
+      );
+      const accountsObj = this.generateAccountsObject(
+        instruction.accounts,
+        shouldFail,
+        setupPDAMap
+      );
+
+      let testName: string;
+      if (shouldFail) {
+        testName = `fails to ${action} ${subject} with unauthorized signer`;
+      } else if (testCase === "edge") {
+        testName = `handles ${action} ${subject} with minimal values`;
+      } else {
+        testName = `successfully ${action}s ${subject}`;
+      }
+
+      if (shouldFail && !instruction.accounts.some((acc) => acc.signer)) {
+        continue;
+      }
+
+      if (testCase === "edge" && instruction.args.length === 0) {
+        continue;
+      }
+
+      tests.push(
+        this.generateTest({
+          name: testName,
+          instruction,
+          methodName,
+          testPDAs,
+          accountsObj,
+          testCase,
+          shouldFail,
+          setupCode,
+          testCounter,
+        })
+      );
+    }
+
+    return tests.join("\n\n");
+  }
+
+  private generateSetupCode(
+    setupInstructions: SetupInstruction[],
+    scopePDANames: Set<string>,
+    testCounter: number
+  ): string {
+    if (setupInstructions.length === 0) return "";
+
+    const lines: string[] = ["\n    // Setup: Create required accounts"];
+    const declaredArgs = new Set<string>();
+    const declaredPDAs = new Set<string>();
+
+    for (const setup of setupInstructions) {
+      for (const [varName, value] of setup.args) {
+        if (!declaredArgs.has(varName)) {
+          const uniqueValue = this.makeValueUnique(value, testCounter);
+          lines.push(`    const ${varName} = ${uniqueValue};`);
+          declaredArgs.add(varName);
+        }
+      }
+
+      for (const acc of setup.instruction.accounts) {
+        if (!acc.pda) continue;
+        if (scopePDANames.has(acc.name)) continue;
+        if (declaredPDAs.has(acc.name)) continue;
+
+        const result = this.seedProcessor.processSeeds(
+          acc.pda.seeds,
+          setup.instruction.args
+        );
+
+        if (result.usesArgs) {
+          const seedsCode = result.expressions
+            .map((e) => `      ${e}`)
+            .join(",\n");
+          lines.push(
+            `    const [${acc.name}Pda] = anchor.web3.PublicKey.findProgramAddressSync(\n` +
+              `      [\n${seedsCode}\n      ],\n` +
+              `      program.programId\n` +
+              `    );`
+          );
+          declaredPDAs.add(acc.name);
+        }
+      }
+
+      const setupArgs = Array.from(setup.args.keys()).join(", ");
+      const setupPDAMap = this.buildSetupPDAMap([setup]);
+      const setupAccounts = this.generateAccountsObject(
+        setup.instruction.accounts,
+        false,
+        setupPDAMap
+      );
+
+      lines.push(
+        `    await program.methods\n` +
+          `      .${setup.methodName}(${setupArgs})\n` +
+          `      .accounts({\n${setupAccounts}\n      })\n` +
+          `      .rpc();`
+      );
+    }
+
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  private generateTest(params: {
+    name: string;
+    instruction: Instruction;
+    methodName: string;
+    testPDAs: string;
+    accountsObj: string;
+    testCase: "success" | "edge";
+    shouldFail: boolean;
+    setupCode: string;
+    testCounter: number;
+  }): string {
+    const hasSetup = params.setupCode.length > 0;
+    const setupVars = hasSetup
+      ? this.extractSetupVars(params.setupCode)
+      : new Set<string>();
+
+    const argDecls = this.generateArgDeclarations(
+      params.instruction.args,
+      params.testCase,
+      setupVars,
+      params.testCounter
+    );
+    const methodArgs = this.generateMethodArgs(params.instruction.args);
+
+    const testBody = params.shouldFail
+      ? `try {
+      await program.methods
+        .${params.methodName}(${methodArgs})
+        .accounts({
+${params.accountsObj}
+        })
+        .rpc();
+      throw new Error("Expected to fail");
+    } catch (err: any) {
+      if (err.message === "Expected to fail") throw err;
+    }`
+      : `await program.methods
+      .${params.methodName}(${methodArgs})
+      .accounts({
+${params.accountsObj}
+      })
+      .rpc();`;
+
+    return `  it("${params.name}", async () => {${params.setupCode}${argDecls}${params.testPDAs}
+    ${testBody}
+  });`;
+  }
+
+  private extractSetupVars(setupCode: string): Set<string> {
+    const vars = new Set<string>();
+    const lines = setupCode.split("\n");
+
+    for (const line of lines) {
+      const constMatch = line.match(/const\s+(\w+)\s*=/);
+      const destructMatch = line.match(/const\s+\[(\w+)Pda\]/);
+
+      if (constMatch) {
+        vars.add(constMatch[1]);
+      }
+      if (destructMatch) {
+        vars.add(destructMatch[1]);
+      }
+    }
+
+    return vars;
+  }
+
+  private extractSetupPDAs(setupCode: string): Set<string> {
+    const pdas = new Set<string>();
+    const lines = setupCode.split("\n");
+
+    for (const line of lines) {
+      const match = line.match(/const\s+\[(\w+)Pda\]/);
+      if (match) {
+        pdas.add(match[1]);
+      }
+    }
+
+    return pdas;
+  }
+
+  private buildSetupPDAMap(
+    setupInstructions: SetupInstruction[]
+  ): Map<string, string> {
+    const map = new Map<string, string>();
+
+    for (const setup of setupInstructions) {
+      for (const acc of setup.instruction.accounts) {
+        if (acc.pda) {
+          map.set(acc.name, `${acc.name}Pda`);
+        }
+      }
+    }
+
+    return map;
+  }
+
+  private makeValueUnique(value: string, testCounter: number): string {
+    if (value.includes("new anchor.BN(")) {
+      return value.replace(
+        /new anchor\.BN\((\d+)\)/,
+        `new anchor.BN(${testCounter})`
+      );
+    }
+
+    if (value.startsWith('"') && value.endsWith('"')) {
+      const content = value.slice(1, -1);
+      if (content === "") return value;
+      return `"${content}_${testCounter}"`;
+    }
+
+    return value;
+  }
+
+  private generateTestLevelPDAs(
+    instruction: Instruction,
+    scopePDANames: Set<string>,
+    setupPDANames: Set<string>,
+    testCounter: number
+  ): string {
+    const pdas: string[] = [];
+
+    for (const acc of instruction.accounts) {
+      if (!acc.pda) continue;
+
+      if (scopePDANames.has(acc.name) || setupPDANames.has(acc.name)) continue;
+
+      const result = this.seedProcessor.processSeeds(
+        acc.pda.seeds,
+        instruction.args
+      );
+
+      if (result.usesArgs) {
+        const seedsCode = result.expressions
+          .map((e) => `      ${e}`)
+          .join(",\n");
+        pdas.push(
+          `    const [${acc.name}Pda] = anchor.web3.PublicKey.findProgramAddressSync(\n` +
+            `      [\n${seedsCode}\n      ],\n` +
+            `      program.programId\n` +
+            `    );`
+        );
+      }
+    }
+
+    return pdas.length > 0 ? "\n" + pdas.join("\n") + "\n" : "";
+  }
+
+  private generateAccountsObject(
+    accounts: Account[],
+    isFailure: boolean,
+    setupPDAMap: Map<string, string> = new Map()
+  ): string {
+    return accounts
+      .map((acc) => {
+        const key = toCamelCase(acc.name);
+
+        if (acc.address || acc.name === "system_program") {
+          return `        ${key}: anchor.web3.SystemProgram.programId`;
+        }
+
+        if (acc.signer) {
+          return `        ${key}: ${
+            isFailure
+              ? "anchor.web3.Keypair.generate().publicKey"
+              : "provider.wallet.publicKey"
+          }`;
+        }
+
+        if (acc.pda) {
+          return `        ${key}: ${acc.name}Pda`;
+        }
+
+        const setupPDA = setupPDAMap.get(acc.name);
+        if (setupPDA) {
+          return `        ${key}: ${setupPDA}`;
+        }
+
+        return `        ${key}: provider.wallet.publicKey`;
+      })
+      .join(",\n");
+  }
+
+  private generateArgDeclarations(
+    args: Arg[],
+    testCase: "success" | "edge",
+    skipVars?: Set<string>,
+    testCounter: number = 1
+  ): string {
+    if (args.length === 0) return "";
+
+    const decls = args
+      .filter((arg) => {
+        const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+        return !skipVars || !skipVars.has(varName);
+      })
+      .map((arg) => {
+        const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+        const value = this.generateArgValue(arg, testCase, testCounter);
+        return `const ${varName} = ${value};`;
+      });
+
+    if (decls.length === 0) return "";
+
+    return `\n    ${decls.join("\n    ")}\n`;
+  }
+
+  private generateArgValue(
+    arg: Arg,
+    testCase: "success" | "edge",
+    testCounter: number = 1
+  ): string {
+    const argType = typeof arg.type === "string" ? arg.type : arg.type.kind;
+    const name = arg.name.toLowerCase();
+
+    if (testCase === "edge") {
+      if (argType === "u64" || argType === "i64") return "new anchor.BN(0)";
+      if (argType === "string") return '""';
+      return "0";
+    }
+
+    if (argType === "u64" || argType === "i64")
+      return `new anchor.BN(${testCounter})`;
+    if (argType === "string") {
+      let baseValue = '"test"';
+      if (name.includes("title")) baseValue = '"Test Title"';
+      else if (name.includes("message")) baseValue = '"Test message"';
+      else if (name.includes("description")) baseValue = '"Test description"';
+      else if (name.includes("name")) baseValue = '"Test"';
+      else if (name.includes("color")) baseValue = '"blue"';
+      else if (name.includes("candidate")) baseValue = '"Alice"';
+
+      if (baseValue === '""') return baseValue;
+      return baseValue.slice(0, -1) + `_${testCounter}"`;
+    }
+
+    return "1";
+  }
+
+  private generateMethodArgs(args: Arg[]): string {
+    return args
+      .map((arg) => {
+        const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+        return varName;
+      })
+      .join(", ");
+  }
+
+  private getAction(name: string): string {
+    const n = name.toLowerCase();
+    if (n.includes("create") || n.includes("init")) return "create";
+    if (n.includes("update")) return "update";
+    if (n.includes("delete")) return "delete";
+    if (n.includes("add")) return "add";
+    if (n.includes("vote")) return "cast vote for";
+    return name.replace(/_/g, " ");
+  }
+
+  private getSubject(name: string): string {
+    const n = name.toLowerCase();
+    if (n.includes("poll")) return "a poll";
+    if (n.includes("candidate")) return "a candidate";
+    if (n.includes("entry") || n.includes("journal")) return "a journal entry";
+    if (n.includes("favorite")) return "favorites";
+    return "data";
+  }
+
+  private wrapTests(
+    programName: string,
+    tests: string[],
+    scopePDAs: string[],
+    debugInfo: string = ""
+  ): string {
+    const title = toTitleCase(programName);
+    const pdaSection =
+      scopePDAs.length > 0 ? "\n" + scopePDAs.join("\n") + "\n" : "";
+
+    return `${debugInfo}import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { ${title} } from "../target/types/${programName}";
+
+describe("${programName}", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.${title} as Program<${title}>;
+${pdaSection}
+${tests.join("\n\n")}
+});
+`;
+  }
+}
+
+// CLI
+class CLI {
+  private forceMode = false;
+  private testsRoot: string;
+  private soltestDir: string;
+  private existingTests: string[] = [];
+
+  constructor() {
+    this.testsRoot = path.join(process.cwd(), "tests");
+    this.soltestDir = path.join(this.testsRoot, "soltest");
+  }
+
+  async run(args: string[]): Promise<void> {
+    const [cmd, ...flags] = args;
+
+    if (cmd !== "generate") {
+      console.error("Usage: soltest generate [--force]");
+      process.exit(1);
+    }
+
+    this.forceMode = flags.includes("--force");
+    console.log("soltest generate\n");
+
+    try {
+      this.detectExistingTests();
+      const { idl, programName } = this.loadIDL();
+
+      console.log(`Program: ${programName}`);
+      console.log(`Instructions: ${idl.instructions.length}\n`);
+
+      // Debug: Check what instructions were selected
+      const generator = new TestGenerator();
+      const selectedIx = (generator as any).selectInstructions(
+        idl.instructions
+      );
+      console.error("\n=== SELECTED INSTRUCTIONS ===");
+      selectedIx.forEach((ix: Instruction) => {
+        console.error(`\n${ix.name}:`);
+        console.error(
+          `  Accounts: ${ix.accounts
+            .map(
+              (a: Account) =>
+                `${
+                  a.name
+                }(pda:${!!a.pda},writable:${!!a.writable},signer:${!!a.signer})`
+            )
+            .join(", ")}`
+        );
+      });
+
+      const testCode = generator.generate(idl, programName);
+
+      await this.handleExistingTests();
+      this.writeTestFile(programName, testCode);
+
+      console.log("\nDone! Run 'anchor test'");
+    } catch (error) {
+      console.error(
+        `\nError: ${error instanceof Error ? error.message : String(error)}`
+      );
+      process.exit(1);
+    }
+  }
+
+  private detectExistingTests(): void {
+    if (!fs.existsSync(this.testsRoot)) return;
+
+    const walk = (dir: string) => {
+      for (const f of fs.readdirSync(dir)) {
+        const full = path.join(dir, f);
+        if (full.startsWith(this.soltestDir)) continue;
+
+        if (fs.statSync(full).isDirectory()) {
+          walk(full);
+        } else if (f.endsWith(".ts")) {
+          this.existingTests.push(full);
+        }
+      }
+    };
+
+    walk(this.testsRoot);
+  }
+
+  private loadIDL(): { idl: IDL; programName: string } {
+    const idlDir = path.join(process.cwd(), "target", "idl");
+
+    if (!fs.existsSync(idlDir)) {
+      throw new Error("target/idl not found. Run 'anchor build'");
+    }
+
+    const idlFiles = fs.readdirSync(idlDir).filter((f) => f.endsWith(".json"));
+
+    if (idlFiles.length === 0) {
+      throw new Error("No IDL files found");
+    }
+
+    const idlPath = path.join(idlDir, idlFiles[0]);
+    const idl = JSON.parse(fs.readFileSync(idlPath, "utf-8"));
+    const programName = path.basename(idlFiles[0], ".json");
+
+    return { idl, programName };
+  }
+
+  private async handleExistingTests(): Promise<void> {
+    if (this.existingTests.length === 0) return;
+
+    const choice = await this.askUser();
+
+    if (choice === "delete") {
+      this.existingTests.forEach((f) => {
+        try {
+          fs.unlinkSync(f);
+        } catch {}
+      });
+      console.log("Cleaned up old tests");
+    }
+  }
+
+  private async askUser(): Promise<"continue" | "delete"> {
+    if (this.forceMode) return "delete";
+
+    console.log("Existing tests found:");
+    this.existingTests.forEach((f) =>
+      console.log(`  ${path.relative(process.cwd(), f)}`)
+    );
+
+    console.log("\n1) Keep  2) Delete (recommended)");
+
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    return new Promise((resolve) => {
+      rl.question("Choice: ", (ans) => {
+        rl.close();
+        resolve(ans.trim() === "2" ? "delete" : "continue");
+      });
+    });
+  }
+
+  private writeTestFile(programName: string, testCode: string): void {
+    fs.mkdirSync(this.soltestDir, { recursive: true });
+    const outPath = path.join(this.soltestDir, `${programName}.test.ts`);
+    fs.writeFileSync(outPath, testCode);
+    console.log(`\nGenerated: ${path.relative(process.cwd(), outPath)}`);
+  }
+}
+
+// Entry
+const [, , ...args] = process.argv;
+new CLI().run(args);
+
+
+
+//try 2 import fs from "fs";
+import path from "path";
+import readline from "readline";
+
+// Types
+interface Seed {
+  kind: "const" | "account" | "arg";
+  value?: number[] | string;
+  path?: string;
+}
+
+interface Account {
+  name: string;
+  writable?: boolean;
+  signer?: boolean;
+  pda?: { seeds: Seed[] };
+  address?: string;
+}
+
+interface Arg {
+  name: string;
+  type: string | { kind: string };
+}
+
+interface Instruction {
+  name: string;
+  accounts: Account[];
+  args: Arg[];
+}
+
+interface IDL {
+  instructions: Instruction[];
+  metadata?: { name: string };
+}
+
+interface SetupInstruction {
+  instruction: Instruction;
+  methodName: string;
+  args: Map<string, string>;
+  pdas: string[];
+}
+
+// Utilities
+const toCamelCase = (s: string): string =>
+  s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+
+const toTitleCase = (s: string): string =>
+  s.charAt(0).toUpperCase() + s.slice(1);
+
+// Seed processor
+class SeedProcessor {
+  processSeeds(seeds: Seed[], args: Arg[]): {
+    expressions: string[];
+    usesArgs: boolean;
+  } {
+    const expressions: string[] = [];
+    let usesArgs = false;
+
+    for (const seed of seeds) {
+      if (seed.kind === "const" && Array.isArray(seed.value)) {
+        expressions.push(`Buffer.from([${seed.value.join(", ")}])`);
+      } else if (seed.kind === "account") {
+        expressions.push("provider.wallet.publicKey.toBuffer()");
+      } else if (seed.kind === "arg") {
+        const arg = args.find(a => a.name === seed.path || a.name === `_${seed.path}`);
+        if (arg) {
+          const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+          const argType = typeof arg.type === "string" ? arg.type : arg.type.kind;
+          
+          if (argType === "u64" || argType === "i64") {
+            expressions.push(`Buffer.from(${varName}.toArrayLike(Buffer, "le", 8))`);
+          } else if (argType === "string") {
+            expressions.push(`Buffer.from(${varName})`);
+          }
+          usesArgs = true;
+        }
+      }
+    }
+
+    return { expressions, usesArgs };
+  }
+}
+
+// Instruction analyzer
+class InstructionAnalyzer {
+  categorize(instruction: Instruction): "create" | "modify" | "delete" | "other" {
+    const name = instruction.name.toLowerCase();
+    
+    if (name.includes("init") || name.includes("create") || name.includes("add")) {
+      const createsPDA = instruction.accounts.some(acc => 
+        acc.pda && acc.writable && !this.isExternalReference(acc, instruction)
+      );
+      if (createsPDA) return "create";
+    }
+    
+    if (name.includes("update")) return "modify";
+    if (name.includes("delete") || name.includes("close")) return "delete";
+    
+    const hasExternalPDA = instruction.accounts.some(acc => 
+      acc.pda && this.isExternalReference(acc, instruction)
+    );
+    
+    if (hasExternalPDA) return "modify";
+    
+    return "other";
+  }
+
+  private isExternalReference(account: Account, instruction: Instruction): boolean {
+    if (!account.pda) return false;
+    
+    for (const seed of account.pda.seeds) {
+      if (seed.kind === "arg") {
+        const argExists = instruction.args.some(a => 
+          a.name === seed.path || a.name === `_${seed.path}`
+        );
+        if (!argExists) return true;
+      }
+    }
+    
+    return false;
+  }
+
+  findDependencies(instruction: Instruction, allInstructions: Instruction[]): Instruction[] {
+    const deps: Instruction[] = [];
+    const category = this.categorize(instruction);
+    
+    if (category !== "create") {
+      for (const acc of instruction.accounts) {
+        if (!acc.pda) continue;
+        
+        for (const otherIx of allInstructions) {
+          if (otherIx.name === instruction.name) continue;
+          
+          const otherCategory = this.categorize(otherIx);
+          if (otherCategory === "create") {
+            const createsCompatiblePDA = otherIx.accounts.some(otherAcc => 
+              otherAcc.pda && this.arePDAsCompatible(acc, otherAcc, instruction, otherIx)
+            );
+            
+            if (createsCompatiblePDA && !deps.includes(otherIx)) {
+              deps.push(otherIx);
+            }
+          }
+        }
+      }
+    }
+    
+    return deps;
+  }
+
+  private arePDAsCompatible(acc1: Account, acc2: Account, ix1: Instruction, ix2: Instruction): boolean {
+    if (!acc1.pda || !acc2.pda) return false;
+    
+    const seeds1 = acc1.pda.seeds;
+    const seeds2 = acc2.pda.seeds;
+    
+    if (seeds1.length !== seeds2.length) return false;
+    
+    for (let i = 0; i < seeds1.length; i++) {
+      const s1 = seeds1[i];
+      const s2 = seeds2[i];
+      
+      if (s1.kind !== s2.kind) return false;
+      
+      if (s1.kind === "const") {
+        if (JSON.stringify(s1.value) !== JSON.stringify(s2.value)) return false;
+      }
+    }
+    
+    return true;
+  }
+}
+
+// Test generator
+class TestGenerator {
+  private seedProcessor = new SeedProcessor();
+  private analyzer = new InstructionAnalyzer();
+
+  generate(idl: IDL, programName: string): string {
+    const instructions = this.selectInstructions(idl.instructions);
+    
+    const setupMap = new Map<string, SetupInstruction[]>();
+    
+    for (const ix of instructions) {
+      const deps = this.analyzer.findDependencies(ix, instructions);
+      if (deps.length > 0) {
+        setupMap.set(ix.name, deps.map(dep => this.buildSetupInstruction(dep)));
+      }
+    }
+
+    const scopePDAs = this.generateAllScopePDAs(instructions);
+    const scopePDANames = new Set(
+      scopePDAs.map(pda => {
+        const match = pda.match(/const \[(\w+)Pda\]/);
+        return match ? match[1] : "";
+      }).filter(Boolean)
+    );
+    
+    const allTests: string[] = [];
+    let testCounter = 1;
+    
+    for (const instruction of instructions) {
+      const setup = setupMap.get(instruction.name) || [];
+      const tests = this.generateInstructionTests(instruction, setup, scopePDANames, testCounter);
+      allTests.push(tests);
+      testCounter += 3;
+    }
+
+    return this.wrapTests(programName, allTests, scopePDAs);
+  }
+
+  private selectInstructions(instructions: Instruction[]): Instruction[] {
+    const scored = instructions.map(ix => {
+      let score = 0;
+      const name = ix.name.toLowerCase();
+      
+      if (name.includes("init") || name.includes("create")) score -= 10;
+      if (name.includes("update")) score -= 5;
+      if (name.includes("delete")) score -= 3;
+      
+      for (const acc of ix.accounts) {
+        if (!acc.pda && !acc.signer && !acc.address) score += 5;
+      }
+      
+      return { instruction: ix, score };
+    });
+
+    scored.sort((a, b) => a.score - b.score);
+    return scored.slice(0, Math.min(3, instructions.length)).map(s => s.instruction);
+  }
+
+  private buildSetupInstruction(instruction: Instruction): SetupInstruction {
+    const args = new Map<string, string>();
+    
+    for (const arg of instruction.args) {
+      const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+      args.set(varName, this.generateArgValue(arg, "success", 1));
+    }
+    
+    const pdas: string[] = [];
+    for (const acc of instruction.accounts) {
+      if (acc.pda) {
+        const result = this.seedProcessor.processSeeds(acc.pda.seeds, instruction.args);
+        if (!result.usesArgs) {
+          pdas.push(acc.name);
+        }
+      }
+    }
+    
+    return {
+      instruction,
+      methodName: toCamelCase(instruction.name),
+      args,
+      pdas
+    };
+  }
+
+  private generateAllScopePDAs(instructions: Instruction[]): string[] {
+    const pdas: string[] = [];
+    const seen = new Set<string>();
+
+    for (const ix of instructions) {
+      for (const acc of ix.accounts) {
+        if (!acc.pda) continue;
+        
+        const result = this.seedProcessor.processSeeds(acc.pda.seeds, ix.args);
+        
+        if (!result.usesArgs && !seen.has(acc.name)) {
+          seen.add(acc.name);
+          const seedsCode = result.expressions.map(e => `      ${e}`).join(",\n");
+          pdas.push(
+            `  const [${acc.name}Pda] = anchor.web3.PublicKey.findProgramAddressSync(\n` +
+            `    [\n${seedsCode}\n    ],\n` +
+            `    program.programId\n` +
+            `  );`
+          );
+        }
+      }
+    }
+
+    return pdas;
+  }
+
+  private generateInstructionTests(
+    instruction: Instruction, 
+    setupInstructions: SetupInstruction[],
+    scopePDANames: Set<string>,
+    baseTestCounter: number
+  ): string {
+    const methodName = toCamelCase(instruction.name);
+    const action = this.getAction(instruction.name);
+    const subject = this.getSubject(instruction.name);
+    
+    const tests: string[] = [];
+    
+    for (let i = 0; i < 3; i++) {
+      const testCounter = baseTestCounter + i;
+      const testCase = i === 0 ? "success" : (i === 2 ? "edge" : "success");
+      const shouldFail = i === 1;
+      
+      const setupCode = this.generateSetupCode(setupInstructions, scopePDANames, testCounter);
+      const setupPDANames = this.extractSetupPDAs(setupCode);
+      const setupPDAMap = this.buildSetupPDAMap(setupInstructions);
+      
+      const testPDAs = this.generateTestLevelPDAs(instruction, scopePDANames, setupPDANames, testCounter);
+      const accountsObj = this.generateAccountsObject(instruction.accounts, shouldFail, setupPDAMap);
+      
+      let testName: string;
+      if (shouldFail) {
+        testName = `fails to ${action} ${subject} with unauthorized signer`;
+      } else if (testCase === "edge") {
+        testName = `handles ${action} ${subject} with minimal values`;
+      } else {
+        testName = `successfully ${action}s ${subject}`;
+      }
+      
+      if (shouldFail && !instruction.accounts.some(acc => acc.signer)) {
+        continue;
+      }
+      
+      if (testCase === "edge" && instruction.args.length === 0) {
+        continue;
+      }
+      
+      tests.push(this.generateTest({
+        name: testName,
+        instruction,
+        methodName,
+        testPDAs,
+        accountsObj,
+        testCase,
+        shouldFail,
+        setupCode,
+        testCounter
+      }));
+    }
+    
+    return tests.join("\n\n");
+  }
+
+  private generateSetupCode(setupInstructions: SetupInstruction[], scopePDANames: Set<string>, testCounter: number): string {
+    if (setupInstructions.length === 0) return "";
+    
+    const lines: string[] = ["\n    // Setup: Create required accounts"];
+    const declaredArgs = new Set<string>();
+    const declaredPDAs = new Set<string>();
+    
+    for (const setup of setupInstructions) {
+      for (const [varName, value] of setup.args) {
+        if (!declaredArgs.has(varName)) {
+          const uniqueValue = this.makeValueUnique(value, testCounter);
+          lines.push(`    const ${varName} = ${uniqueValue};`);
+          declaredArgs.add(varName);
+        }
+      }
+      
+      for (const acc of setup.instruction.accounts) {
+        if (!acc.pda) continue;
+        if (scopePDANames.has(acc.name)) continue;
+        if (declaredPDAs.has(acc.name)) continue;
+        
+        const result = this.seedProcessor.processSeeds(acc.pda.seeds, setup.instruction.args);
+        
+        if (result.usesArgs) {
+          const seedsCode = result.expressions.map(e => `      ${e}`).join(",\n");
+          lines.push(
+            `    const [${acc.name}Pda] = anchor.web3.PublicKey.findProgramAddressSync(\n` +
+            `      [\n${seedsCode}\n      ],\n` +
+            `      program.programId\n` +
+            `    );`
+          );
+          declaredPDAs.add(acc.name);
+        }
+      }
+      
+      const setupArgs = Array.from(setup.args.keys()).join(", ");
+      const setupPDAMap = this.buildSetupPDAMap([setup]);
+      const setupAccounts = this.generateAccountsObject(setup.instruction.accounts, false, setupPDAMap);
+      
+      lines.push(
+        `    await program.methods\n` +
+        `      .${setup.methodName}(${setupArgs})\n` +
+        `      .accounts({\n${setupAccounts}\n      })\n` +
+        `      .rpc();`
+      );
+    }
+    
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  private generateTest(params: {
+    name: string;
+    instruction: Instruction;
+    methodName: string;
+    testPDAs: string;
+    accountsObj: string;
+    testCase: "success" | "edge";
+    shouldFail: boolean;
+    setupCode: string;
+    testCounter: number;
+  }): string {
+    const hasSetup = params.setupCode.length > 0;
+    const setupVars = hasSetup ? this.extractSetupVars(params.setupCode) : new Set<string>();
+    
+    const argDecls = this.generateArgDeclarations(
+      params.instruction.args, 
+      params.testCase,
+      setupVars,
+      params.testCounter
+    );
+    const methodArgs = this.generateMethodArgs(params.instruction.args);
+    
+    const testBody = params.shouldFail
+      ? `try {
+      await program.methods
+        .${params.methodName}(${methodArgs})
+        .accounts({
+${params.accountsObj}
+        })
+        .rpc();
+      throw new Error("Expected to fail");
+    } catch (err: any) {
+      if (err.message === "Expected to fail") throw err;
+    }`
+      : `await program.methods
+      .${params.methodName}(${methodArgs})
+      .accounts({
+${params.accountsObj}
+      })
+      .rpc();`;
+
+    return `  it("${params.name}", async () => {${params.setupCode}${argDecls}${params.testPDAs}
+    ${testBody}
+  });`;
+  }
+
+  private extractSetupVars(setupCode: string): Set<string> {
+    const vars = new Set<string>();
+    const lines = setupCode.split('\n');
+    
+    for (const line of lines) {
+      const constMatch = line.match(/const\s+(\w+)\s*=/);
+      const destructMatch = line.match(/const\s+\[(\w+)Pda\]/);
+      
+      if (constMatch) {
+        vars.add(constMatch[1]);
+      }
+      if (destructMatch) {
+        vars.add(destructMatch[1]);
+      }
+    }
+    
+    return vars;
+  }
+
+  private extractSetupPDAs(setupCode: string): Set<string> {
+    const pdas = new Set<string>();
+    const lines = setupCode.split('\n');
+    
+    for (const line of lines) {
+      const match = line.match(/const\s+\[(\w+)Pda\]/);
+      if (match) {
+        pdas.add(match[1]);
+      }
+    }
+    
+    return pdas;
+  }
+
+  private buildSetupPDAMap(setupInstructions: SetupInstruction[]): Map<string, string> {
+    const map = new Map<string, string>();
+    
+    for (const setup of setupInstructions) {
+      for (const acc of setup.instruction.accounts) {
+        if (acc.pda) {
+          map.set(acc.name, `${acc.name}Pda`);
+        }
+      }
+    }
+    
+    return map;
+  }
+
+  private makeValueUnique(value: string, testCounter: number): string {
+    if (value.includes("new anchor.BN(")) {
+      return value.replace(/new anchor\.BN\((\d+)\)/, `new anchor.BN(${testCounter})`);
+    }
+    
+    if (value.startsWith('"') && value.endsWith('"')) {
+      const content = value.slice(1, -1);
+      if (content === "") return value;
+      return `"${content}_${testCounter}"`;
+    }
+    
+    return value;
+  }
+
+  private generateTestLevelPDAs(instruction: Instruction, scopePDANames: Set<string>, setupPDANames: Set<string>, testCounter: number): string {
+    const pdas: string[] = [];
+
+    for (const acc of instruction.accounts) {
+      if (!acc.pda) continue;
+
+      if (scopePDANames.has(acc.name) || setupPDANames.has(acc.name)) continue;
+
+      const result = this.seedProcessor.processSeeds(acc.pda.seeds, instruction.args);
+      
+      if (result.usesArgs) {
+        const seedsCode = result.expressions.map(e => `      ${e}`).join(",\n");
+        pdas.push(
+          `    const [${acc.name}Pda] = anchor.web3.PublicKey.findProgramAddressSync(\n` +
+          `      [\n${seedsCode}\n      ],\n` +
+          `      program.programId\n` +
+          `    );`
+        );
+      }
+    }
+
+    return pdas.length > 0 ? "\n" + pdas.join("\n") + "\n" : "";
+  }
+
+  private generateAccountsObject(accounts: Account[], isFailure: boolean, setupPDAMap: Map<string, string> = new Map()): string {
+    return accounts
+      .map(acc => {
+        const key = toCamelCase(acc.name);
+        
+        if (acc.address || acc.name === "system_program") {
+          return `        ${key}: anchor.web3.SystemProgram.programId`;
+        }
+        
+        if (acc.signer) {
+          return `        ${key}: ${isFailure ? "anchor.web3.Keypair.generate().publicKey" : "provider.wallet.publicKey"}`;
+        }
+        
+        if (acc.pda) {
+          return `        ${key}: ${acc.name}Pda`;
+        }
+        
+        const setupPDA = setupPDAMap.get(acc.name);
+        if (setupPDA) {
+          return `        ${key}: ${setupPDA}`;
+        }
+        
+        return `        ${key}: provider.wallet.publicKey`;
+      })
+      .join(",\n");
+  }
+
+  private generateArgDeclarations(args: Arg[], testCase: "success" | "edge", skipVars?: Set<string>, testCounter: number = 1): string {
+    if (args.length === 0) return "";
+    
+    const decls = args
+      .filter(arg => {
+        const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+        return !skipVars || !skipVars.has(varName);
+      })
+      .map(arg => {
+        const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+        const value = this.generateArgValue(arg, testCase, testCounter);
+        return `const ${varName} = ${value};`;
+      });
+    
+    if (decls.length === 0) return "";
+    
+    return `\n    ${decls.join("\n    ")}\n`;
+  }
+
+  private generateArgValue(arg: Arg, testCase: "success" | "edge", testCounter: number = 1): string {
+    const argType = typeof arg.type === "string" ? arg.type : arg.type.kind;
+    const name = arg.name.toLowerCase();
+    
+    if (testCase === "edge") {
+      if (argType === "u64" || argType === "i64") return "new anchor.BN(0)";
+      if (argType === "string") return '""';
+      return "0";
+    }
+    
+    if (argType === "u64" || argType === "i64") return `new anchor.BN(${testCounter})`;
+    if (argType === "string") {
+      let baseValue = '"test"';
+      if (name.includes("title")) baseValue = '"Test Title"';
+      else if (name.includes("message")) baseValue = '"Test message"';
+      else if (name.includes("description")) baseValue = '"Test description"';
+      else if (name.includes("name")) baseValue = '"Test"';
+      else if (name.includes("color")) baseValue = '"blue"';
+      else if (name.includes("candidate")) baseValue = '"Alice"';
+      
+      if (baseValue === '""') return baseValue;
+      return baseValue.slice(0, -1) + `_${testCounter}"`;
+    }
+    
+    return "1";
+  }
+
+  private generateMethodArgs(args: Arg[]): string {
+    return args.map(arg => {
+      const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+      return varName;
+    }).join(", ");
+  }
+
+  private getAction(name: string): string {
+    const n = name.toLowerCase();
+    if (n.includes("create") || n.includes("init")) return "create";
+    if (n.includes("update")) return "update";
+    if (n.includes("delete")) return "delete";
+    if (n.includes("add")) return "add";
+    if (n.includes("vote")) return "cast vote for";
+    return name.replace(/_/g, " ");
+  }
+
+  private getSubject(name: string): string {
+    const n = name.toLowerCase();
+    if (n.includes("poll")) return "a poll";
+    if (n.includes("candidate")) return "a candidate";
+    if (n.includes("entry") || n.includes("journal")) return "a journal entry";
+    if (n.includes("favorite")) return "favorites";
+    return "data";
+  }
+
+  private wrapTests(programName: string, tests: string[], scopePDAs: string[]): string {
+    const title = toTitleCase(programName);
+    const pdaSection = scopePDAs.length > 0 ? "\n" + scopePDAs.join("\n") + "\n" : "";
+    
+    return `import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { ${title} } from "../target/types/${programName}";
+
+describe("${programName}", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.${title} as Program<${title}>;
+${pdaSection}
+${tests.join("\n\n")}
+});
+`;
+  }
+}
+
+// CLI
+class CLI {
+  private forceMode = false;
+  private testsRoot: string;
+  private soltestDir: string;
+  private existingTests: string[] = [];
+
+  constructor() {
+    this.testsRoot = path.join(process.cwd(), "tests");
+    this.soltestDir = path.join(this.testsRoot, "soltest");
+  }
+
+  async run(args: string[]): Promise<void> {
+    const [cmd, ...flags] = args;
+
+    if (cmd !== "generate") {
+      console.error("Usage: soltest generate [--force]");
+      process.exit(1);
+    }
+
+    this.forceMode = flags.includes("--force");
+    console.log("soltest generate\n");
+
+    try {
+      this.detectExistingTests();
+      const { idl, programName } = this.loadIDL();
+      
+      console.log(`Program: ${programName}`);
+      console.log(`Instructions: ${idl.instructions.length}\n`);
+
+      const generator = new TestGenerator();
+      const testCode = generator.generate(idl, programName);
+
+      await this.handleExistingTests();
+      this.writeTestFile(programName, testCode);
+
+      console.log("\nDone! Run 'anchor test'");
+    } catch (error) {
+      console.error(`\nError: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    }
+  }
+
+  private detectExistingTests(): void {
+    if (!fs.existsSync(this.testsRoot)) return;
+
+    const walk = (dir: string) => {
+      for (const f of fs.readdirSync(dir)) {
+        const full = path.join(dir, f);
+        if (full.startsWith(this.soltestDir)) continue;
+        
+        if (fs.statSync(full).isDirectory()) {
+          walk(full);
+        } else if (f.endsWith(".ts")) {
+          this.existingTests.push(full);
+        }
+      }
+    };
+
+    walk(this.testsRoot);
+  }
+
+  private loadIDL(): { idl: IDL; programName: string } {
+    const idlDir = path.join(process.cwd(), "target", "idl");
+    
+    if (!fs.existsSync(idlDir)) {
+      throw new Error("target/idl not found. Run 'anchor build'");
+    }
+
+    const idlFiles = fs.readdirSync(idlDir).filter(f => f.endsWith(".json"));
+    
+    if (idlFiles.length === 0) {
+      throw new Error("No IDL files found");
+    }
+
+    const idlPath = path.join(idlDir, idlFiles[0]);
+    const idl = JSON.parse(fs.readFileSync(idlPath, "utf-8"));
+    const programName = path.basename(idlFiles[0], ".json");
+
+    return { idl, programName };
+  }
+
+  private async handleExistingTests(): Promise<void> {
+    if (this.existingTests.length === 0) return;
+
+    const choice = await this.askUser();
+
+    if (choice === "delete") {
+      this.existingTests.forEach(f => {
+        try {
+          fs.unlinkSync(f);
+        } catch {}
+      });
+      console.log("Cleaned up old tests");
+    }
+  }
+
+  private async askUser(): Promise<"continue" | "delete"> {
+    if (this.forceMode) return "delete";
+
+    console.log("Existing tests found:");
+    this.existingTests.forEach(f => console.log(`  ${path.relative(process.cwd(), f)}`));
+
+    console.log("\n1) Keep  2) Delete (recommended)");
+
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    return new Promise(resolve => {
+      rl.question("Choice: ", ans => {
+        rl.close();
+        resolve(ans.trim() === "2" ? "delete" : "continue");
+      });
+    });
+  }
+
+  private writeTestFile(programName: string, testCode: string): void {
+    fs.mkdirSync(this.soltestDir, { recursive: true });
+    const outPath = path.join(this.soltestDir, `${programName}.test.ts`);
+    fs.writeFileSync(outPath, testCode);
+    console.log(`\nGenerated: ${path.relative(process.cwd(), outPath)}`);
+  }
+}
+
+// Entry
+const [, , ...args] = process.argv;
+new CLI().run(args);
+
+//attempt 3rd 
+import fs from "fs";
+import path from "path";
+import readline from "readline";
+
+// Types
+interface Seed {
+  kind: "const" | "account" | "arg";
+  value?: number[] | string;
+  path?: string;
+}
+
+interface Account {
+  name: string;
+  writable?: boolean;
+  signer?: boolean;
+  pda?: { seeds: Seed[] };
+  address?: string;
+}
+
+interface Arg {
+  name: string;
+  type: string | { kind: string };
+}
+
+interface Instruction {
+  name: string;
+  accounts: Account[];
+  args: Arg[];
+}
+
+interface IDL {
+  instructions: Instruction[];
+  metadata?: { name: string };
+}
+
+interface SetupInstruction {
+  instruction: Instruction;
+  methodName: string;
+  args: Map<string, string>;
+  pdas: string[];
+}
+
+// Utilities
+const toCamelCase = (s: string): string =>
+  s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+
+const toTitleCase = (s: string): string =>
+  s.charAt(0).toUpperCase() + s.slice(1);
+
+// Seed processor
+class SeedProcessor {
+  processSeeds(seeds: Seed[], args: Arg[]): {
+    expressions: string[];
+    usesArgs: boolean;
+  } {
+    const expressions: string[] = [];
+    let usesArgs = false;
+
+    for (const seed of seeds) {
+      if (seed.kind === "const" && Array.isArray(seed.value)) {
+        expressions.push(`Buffer.from([${seed.value.join(", ")}])`);
+      } else if (seed.kind === "account") {
+        expressions.push("provider.wallet.publicKey.toBuffer()");
+      } else if (seed.kind === "arg") {
+        const arg = args.find(a => a.name === seed.path || a.name === `_${seed.path}`);
+        if (arg) {
+          const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+          const argType = typeof arg.type === "string" ? arg.type : arg.type.kind;
+          
+          if (argType === "u64" || argType === "i64") {
+            expressions.push(`Buffer.from(${varName}.toArrayLike(Buffer, "le", 8))`);
+          } else if (argType === "string") {
+            expressions.push(`Buffer.from(${varName})`);
+          }
+          usesArgs = true;
+        }
+      }
+    }
+
+    return { expressions, usesArgs };
+  }
+}
+
+// Instruction analyzer
+class InstructionAnalyzer {
+  categorize(instruction: Instruction): "create" | "modify" | "delete" | "other" {
+    const name = instruction.name.toLowerCase();
+    
+    if (name.includes("init") || name.includes("create") || name.includes("add")) {
+      const createsPDA = instruction.accounts.some(acc => 
+        acc.pda && acc.writable && !this.isExternalReference(acc, instruction)
+      );
+      if (createsPDA) return "create";
+    }
+    
+    if (name.includes("update")) return "modify";
+    if (name.includes("delete") || name.includes("close")) return "delete";
+    
+    const hasExternalPDA = instruction.accounts.some(acc => 
+      acc.pda && this.isExternalReference(acc, instruction)
+    );
+    
+    if (hasExternalPDA) return "modify";
+    
+    return "other";
+  }
+
+  private isExternalReference(account: Account, instruction: Instruction): boolean {
+    if (!account.pda) return false;
+    
+    for (const seed of account.pda.seeds) {
+      if (seed.kind === "arg") {
+        const argExists = instruction.args.some(a => 
+          a.name === seed.path || a.name === `_${seed.path}`
+        );
+        if (!argExists) return true;
+      }
+    }
+    
+    return false;
+  }
+
+  findDependencies(instruction: Instruction, allInstructions: Instruction[]): Instruction[] {
+    const deps: Instruction[] = [];
+    const category = this.categorize(instruction);
+    
+    if (category !== "create") {
+      for (const acc of instruction.accounts) {
+        if (!acc.pda) continue;
+        
+        for (const otherIx of allInstructions) {
+          if (otherIx.name === instruction.name) continue;
+          
+          const otherCategory = this.categorize(otherIx);
+          if (otherCategory === "create") {
+            const createsCompatiblePDA = otherIx.accounts.some(otherAcc => 
+              otherAcc.pda && this.arePDAsCompatible(acc, otherAcc, instruction, otherIx)
+            );
+            
+            if (createsCompatiblePDA && !deps.includes(otherIx)) {
+              deps.push(otherIx);
+            }
+          }
+        }
+      }
+    }
+    
+    return deps;
+  }
+
+  private arePDAsCompatible(acc1: Account, acc2: Account, ix1: Instruction, ix2: Instruction): boolean {
+    if (!acc1.pda || !acc2.pda) return false;
+    
+    const seeds1 = acc1.pda.seeds;
+    const seeds2 = acc2.pda.seeds;
+    
+    if (seeds1.length !== seeds2.length) return false;
+    
+    for (let i = 0; i < seeds1.length; i++) {
+      const s1 = seeds1[i];
+      const s2 = seeds2[i];
+      
+      if (s1.kind !== s2.kind) return false;
+      
+      if (s1.kind === "const") {
+        if (JSON.stringify(s1.value) !== JSON.stringify(s2.value)) return false;
+      }
+    }
+    
+    return true;
+  }
+}
+
+// Test generator
+class TestGenerator {
+  private seedProcessor = new SeedProcessor();
+  private analyzer = new InstructionAnalyzer();
+
+  generate(idl: IDL, programName: string): string {
+    const instructions = this.selectInstructions(idl.instructions);
+    
+    const setupMap = new Map<string, SetupInstruction[]>();
+    
+    for (const ix of instructions) {
+      const deps = this.analyzer.findDependencies(ix, instructions);
+      if (deps.length > 0) {
+        setupMap.set(ix.name, deps.map(dep => this.buildSetupInstruction(dep)));
+      }
+    }
+
+    const scopePDAs = this.generateAllScopePDAs(instructions);
+    const scopePDANames = new Set(
+      scopePDAs.map(pda => {
+        const match = pda.match(/const \[(\w+)Pda\]/);
+        return match ? match[1] : "";
+      }).filter(Boolean)
+    );
+    
+    const allTests: string[] = [];
+    let testCounter = 1;
+    
+    for (const instruction of instructions) {
+      const setup = setupMap.get(instruction.name) || [];
+      const tests = this.generateInstructionTests(instruction, setup, scopePDANames, testCounter);
+      allTests.push(tests);
+      testCounter += 3;
+    }
+
+    return this.wrapTests(programName, allTests, scopePDAs);
+  }
+
+  private selectInstructions(instructions: Instruction[]): Instruction[] {
+    const scored = instructions.map(ix => {
+      let score = 0;
+      const name = ix.name.toLowerCase();
+      
+      if (name.includes("init") || name.includes("create")) score -= 10;
+      if (name.includes("update")) score -= 5;
+      if (name.includes("delete")) score -= 3;
+      
+      for (const acc of ix.accounts) {
+        if (!acc.pda && !acc.signer && !acc.address) score += 5;
+      }
+      
+      return { instruction: ix, score };
+    });
+
+    scored.sort((a, b) => a.score - b.score);
+    return scored.slice(0, Math.min(3, instructions.length)).map(s => s.instruction);
+  }
+
+  private buildSetupInstruction(instruction: Instruction): SetupInstruction {
+    const args = new Map<string, string>();
+    
+    for (const arg of instruction.args) {
+      const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+      args.set(varName, this.generateArgValue(arg, "success", 1));
+    }
+    
+    const pdas: string[] = [];
+    for (const acc of instruction.accounts) {
+      if (acc.pda) {
+        const result = this.seedProcessor.processSeeds(acc.pda.seeds, instruction.args);
+        if (!result.usesArgs) {
+          pdas.push(acc.name);
+        }
+      }
+    }
+    
+    return {
+      instruction,
+      methodName: toCamelCase(instruction.name),
+      args,
+      pdas
+    };
+  }
+
+  private generateAllScopePDAs(instructions: Instruction[]): string[] {
+    const pdas: string[] = [];
+    const seen = new Set<string>();
+
+    for (const ix of instructions) {
+      for (const acc of ix.accounts) {
+        if (!acc.pda) continue;
+        
+        const result = this.seedProcessor.processSeeds(acc.pda.seeds, ix.args);
+        
+        if (!result.usesArgs && !seen.has(acc.name)) {
+          seen.add(acc.name);
+          const seedsCode = result.expressions.map(e => `      ${e}`).join(",\n");
+          pdas.push(
+            `  const [${acc.name}Pda] = anchor.web3.PublicKey.findProgramAddressSync(\n` +
+            `    [\n${seedsCode}\n    ],\n` +
+            `    program.programId\n` +
+            `  );`
+          );
+        }
+      }
+    }
+
+    return pdas;
+  }
+
+  private generateInstructionTests(
+    instruction: Instruction, 
+    setupInstructions: SetupInstruction[],
+    scopePDANames: Set<string>,
+    baseTestCounter: number
+  ): string {
+    const methodName = toCamelCase(instruction.name);
+    const action = this.getAction(instruction.name);
+    const subject = this.getSubject(instruction.name);
+    
+    const tests: string[] = [];
+    
+    for (let i = 0; i < 3; i++) {
+      const testCounter = baseTestCounter + i;
+      const testCase = i === 0 ? "success" : (i === 2 ? "edge" : "success");
+      const shouldFail = i === 1;
+      
+      const setupCode = this.generateSetupCode(setupInstructions, scopePDANames, testCounter);
+      const setupPDANames = this.extractSetupPDAs(setupCode);
+      const setupPDAMap = this.buildSetupPDAMap(setupInstructions);
+      
+      const testPDAs = this.generateTestLevelPDAs(instruction, scopePDANames, setupPDANames, testCounter);
+      const accountsObj = this.generateAccountsObject(instruction.accounts, shouldFail, setupPDAMap);
+      
+      let testName: string;
+      if (shouldFail) {
+        testName = `fails to ${action} ${subject} with unauthorized signer`;
+      } else if (testCase === "edge") {
+        testName = `handles ${action} ${subject} with minimal values`;
+      } else {
+        testName = `successfully ${action}s ${subject}`;
+      }
+      
+      if (shouldFail && !instruction.accounts.some(acc => acc.signer)) {
+        continue;
+      }
+      
+      if (testCase === "edge" && instruction.args.length === 0) {
+        continue;
+      }
+      
+      tests.push(this.generateTest({
+        name: testName,
+        instruction,
+        methodName,
+        testPDAs,
+        accountsObj,
+        testCase,
+        shouldFail,
+        setupCode,
+        testCounter
+      }));
+    }
+    
+    return tests.join("\n\n");
+  }
+
+  private generateSetupCode(setupInstructions: SetupInstruction[], scopePDANames: Set<string>, testCounter: number): string {
+    if (setupInstructions.length === 0) return "";
+    
+    const lines: string[] = ["\n    // Setup: Create required accounts"];
+    const declaredArgs = new Set<string>();
+    const declaredPDAs = new Set<string>();
+    
+    for (const setup of setupInstructions) {
+      for (const [varName, value] of setup.args) {
+        if (!declaredArgs.has(varName)) {
+          const uniqueValue = this.makeValueUnique(value, testCounter);
+          lines.push(`    const ${varName} = ${uniqueValue};`);
+          declaredArgs.add(varName);
+        }
+      }
+      
+      for (const acc of setup.instruction.accounts) {
+        if (!acc.pda) continue;
+        if (scopePDANames.has(acc.name)) continue;
+        if (declaredPDAs.has(acc.name)) continue;
+        
+        const result = this.seedProcessor.processSeeds(acc.pda.seeds, setup.instruction.args);
+        
+        if (result.usesArgs) {
+          const seedsCode = result.expressions.map(e => `      ${e}`).join(",\n");
+          lines.push(
+            `    const [${acc.name}Pda] = anchor.web3.PublicKey.findProgramAddressSync(\n` +
+            `      [\n${seedsCode}\n      ],\n` +
+            `      program.programId\n` +
+            `    );`
+          );
+          declaredPDAs.add(acc.name);
+        }
+      }
+      
+      const setupArgs = Array.from(setup.args.keys()).join(", ");
+      const setupPDAMap = this.buildSetupPDAMap([setup]);
+      const setupAccounts = this.generateAccountsObject(setup.instruction.accounts, false, setupPDAMap);
+      
+      lines.push(
+        `    await program.methods\n` +
+        `      .${setup.methodName}(${setupArgs})\n` +
+        `      .accounts({\n${setupAccounts}\n      })\n` +
+        `      .rpc();`
+      );
+    }
+    
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  private generateTest(params: {
+    name: string;
+    instruction: Instruction;
+    methodName: string;
+    testPDAs: string;
+    accountsObj: string;
+    testCase: "success" | "edge";
+    shouldFail: boolean;
+    setupCode: string;
+    testCounter: number;
+  }): string {
+    const hasSetup = params.setupCode.length > 0;
+    const setupVars = hasSetup ? this.extractSetupVars(params.setupCode) : new Set<string>();
+    
+    const argDecls = this.generateArgDeclarations(
+      params.instruction.args, 
+      params.testCase,
+      setupVars,
+      params.testCounter
+    );
+    const methodArgs = this.generateMethodArgs(params.instruction.args);
+    
+    const testBody = params.shouldFail
+      ? `try {
+      await program.methods
+        .${params.methodName}(${methodArgs})
+        .accounts({
+${params.accountsObj}
+        })
+        .rpc();
+      throw new Error("Expected to fail");
+    } catch (err: any) {
+      if (err.message === "Expected to fail") throw err;
+    }`
+      : `await program.methods
+      .${params.methodName}(${methodArgs})
+      .accounts({
+${params.accountsObj}
+      })
+      .rpc();`;
+
+    return `  it("${params.name}", async () => {${params.setupCode}${argDecls}${params.testPDAs}
+    ${testBody}
+  });`;
+  }
+
+  private extractSetupVars(setupCode: string): Set<string> {
+    const vars = new Set<string>();
+    const lines = setupCode.split('\n');
+    
+    for (const line of lines) {
+      const constMatch = line.match(/const\s+(\w+)\s*=/);
+      const destructMatch = line.match(/const\s+\[(\w+)Pda\]/);
+      
+      if (constMatch) {
+        vars.add(constMatch[1]);
+      }
+      if (destructMatch) {
+        vars.add(destructMatch[1]);
+      }
+    }
+    
+    return vars;
+  }
+
+  private extractSetupPDAs(setupCode: string): Set<string> {
+    const pdas = new Set<string>();
+    const lines = setupCode.split('\n');
+    
+    for (const line of lines) {
+      const match = line.match(/const\s+\[(\w+)Pda\]/);
+      if (match) {
+        pdas.add(match[1]);
+      }
+    }
+    
+    return pdas;
+  }
+
+  private buildSetupPDAMap(setupInstructions: SetupInstruction[]): Map<string, string> {
+    const map = new Map<string, string>();
+    
+    for (const setup of setupInstructions) {
+      for (const acc of setup.instruction.accounts) {
+        if (acc.pda) {
+          map.set(acc.name, `${acc.name}Pda`);
+        }
+      }
+    }
+    
+    return map;
+  }
+
+  private makeValueUnique(value: string, testCounter: number): string {
+    if (value.includes("new anchor.BN(")) {
+      return value.replace(/new anchor\.BN\((\d+)\)/, `new anchor.BN(${testCounter})`);
+    }
+    
+    if (value.startsWith('"') && value.endsWith('"')) {
+      const content = value.slice(1, -1);
+      if (content === "") return value;
+      return `"${content}_${testCounter}"`;
+    }
+    
+    return value;
+  }
+
+  private generateTestLevelPDAs(instruction: Instruction, scopePDANames: Set<string>, setupPDANames: Set<string>, testCounter: number): string {
+    const pdas: string[] = [];
+
+    for (const acc of instruction.accounts) {
+      if (!acc.pda) continue;
+
+      if (scopePDANames.has(acc.name) || setupPDANames.has(acc.name)) continue;
+
+      const result = this.seedProcessor.processSeeds(acc.pda.seeds, instruction.args);
+      
+      if (result.usesArgs) {
+        const seedsCode = result.expressions.map(e => `      ${e}`).join(",\n");
+        pdas.push(
+          `    const [${acc.name}Pda] = anchor.web3.PublicKey.findProgramAddressSync(\n` +
+          `      [\n${seedsCode}\n      ],\n` +
+          `      program.programId\n` +
+          `    );`
+        );
+      }
+    }
+
+    return pdas.length > 0 ? "\n" + pdas.join("\n") + "\n" : "";
+  }
+
+  private generateAccountsObject(accounts: Account[], isFailure: boolean, setupPDAMap: Map<string, string> = new Map()): string {
+    return accounts
+      .map(acc => {
+        const key = toCamelCase(acc.name);
+        
+        if (acc.address || acc.name === "system_program") {
+          return `        ${key}: anchor.web3.SystemProgram.programId`;
+        }
+        
+        if (acc.signer) {
+          return `        ${key}: ${isFailure ? "anchor.web3.Keypair.generate().publicKey" : "provider.wallet.publicKey"}`;
+        }
+        
+        if (acc.pda) {
+          return `        ${key}: ${acc.name}Pda`;
+        }
+        
+        const setupPDA = setupPDAMap.get(acc.name);
+        if (setupPDA) {
+          return `        ${key}: ${setupPDA}`;
+        }
+        
+        return `        ${key}: provider.wallet.publicKey`;
+      })
+      .join(",\n");
+  }
+
+  private generateArgDeclarations(args: Arg[], testCase: "success" | "edge", skipVars?: Set<string>, testCounter: number = 1): string {
+    if (args.length === 0) return "";
+    
+    const decls = args
+      .filter(arg => {
+        const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+        return !skipVars || !skipVars.has(varName);
+      })
+      .map(arg => {
+        const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+        const value = this.generateArgValue(arg, testCase, testCounter);
+        return `const ${varName} = ${value};`;
+      });
+    
+    if (decls.length === 0) return "";
+    
+    return `\n    ${decls.join("\n    ")}\n`;
+  }
+
+  private generateArgValue(arg: Arg, testCase: "success" | "edge", testCounter: number = 1): string {
+    const argType = typeof arg.type === "string" ? arg.type : arg.type.kind;
+    const name = arg.name.toLowerCase();
+    
+    if (testCase === "edge") {
+      if (argType === "u64" || argType === "i64") return "new anchor.BN(0)";
+      if (argType === "string") return '""';
+      return "0";
+    }
+    
+    if (argType === "u64" || argType === "i64") return `new anchor.BN(${testCounter})`;
+    if (argType === "string") {
+      let baseValue = '"test"';
+      if (name.includes("title")) baseValue = '"Test Title"';
+      else if (name.includes("message")) baseValue = '"Test message"';
+      else if (name.includes("description")) baseValue = '"Test description"';
+      else if (name.includes("name")) baseValue = '"Test"';
+      else if (name.includes("color")) baseValue = '"blue"';
+      else if (name.includes("candidate")) baseValue = '"Alice"';
+      
+      if (baseValue === '""') return baseValue;
+      return baseValue.slice(0, -1) + `_${testCounter}"`;
+    }
+    
+    return "1";
+  }
+
+  private generateMethodArgs(args: Arg[]): string {
+    return args.map(arg => {
+      const varName = arg.name.startsWith("_") ? arg.name.slice(1) : arg.name;
+      return varName;
+    }).join(", ");
+  }
+
+  private getAction(name: string): string {
+    const n = name.toLowerCase();
+    if (n.includes("create") || n.includes("init")) return "create";
+    if (n.includes("update")) return "update";
+    if (n.includes("delete")) return "delete";
+    if (n.includes("add")) return "add";
+    if (n.includes("vote")) return "cast vote for";
+    return name.replace(/_/g, " ");
+  }
+
+  private getSubject(name: string): string {
+    const n = name.toLowerCase();
+    if (n.includes("poll")) return "a poll";
+    if (n.includes("candidate")) return "a candidate";
+    if (n.includes("entry") || n.includes("journal")) return "a journal entry";
+    if (n.includes("favorite")) return "favorites";
+    return "data";
+  }
+
+  private wrapTests(programName: string, tests: string[], scopePDAs: string[]): string {
+    const title = toTitleCase(programName);
+    const pdaSection = scopePDAs.length > 0 ? "\n" + scopePDAs.join("\n") + "\n" : "";
+    
+    return `import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { ${title} } from "../target/types/${programName}";
+
+describe("${programName}", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+  const program = anchor.workspace.${title} as Program<${title}>;
+${pdaSection}
+${tests.join("\n\n")}
+});
+`;
+  }
+}
+
+// CLI
+class CLI {
+  private forceMode = false;
+  private testsRoot: string;
+  private soltestDir: string;
+  private existingTests: string[] = [];
+
+  constructor() {
+    this.testsRoot = path.join(process.cwd(), "tests");
+    this.soltestDir = path.join(this.testsRoot, "soltest");
+  }
+
+  async run(args: string[]): Promise<void> {
+    const [cmd, ...flags] = args;
+
+    if (cmd !== "generate") {
+      console.error("Usage: soltest generate [--force]");
+      process.exit(1);
+    }
+
+    this.forceMode = flags.includes("--force");
+    console.log("soltest generate\n");
+
+    try {
+      this.detectExistingTests();
+      const { idl, programName } = this.loadIDL();
+      
+      console.log(`Program: ${programName}`);
+      console.log(`Instructions: ${idl.instructions.length}\n`);
+
+      const generator = new TestGenerator();
+      const testCode = generator.generate(idl, programName);
+
+      await this.handleExistingTests();
+      this.writeTestFile(programName, testCode);
+
+      console.log("\nDone! Run 'anchor test'");
+    } catch (error) {
+      console.error(`\nError: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    }
+  }
+
+  private detectExistingTests(): void {
+    if (!fs.existsSync(this.testsRoot)) return;
+
+    const walk = (dir: string) => {
+      for (const f of fs.readdirSync(dir)) {
+        const full = path.join(dir, f);
+        if (full.startsWith(this.soltestDir)) continue;
+        
+        if (fs.statSync(full).isDirectory()) {
+          walk(full);
+        } else if (f.endsWith(".ts")) {
+          this.existingTests.push(full);
+        }
+      }
+    };
+
+    walk(this.testsRoot);
+  }
+
+  private loadIDL(): { idl: IDL; programName: string } {
+    const idlDir = path.join(process.cwd(), "target", "idl");
+    
+    if (!fs.existsSync(idlDir)) {
+      throw new Error("target/idl not found. Run 'anchor build'");
+    }
+
+    const idlFiles = fs.readdirSync(idlDir).filter(f => f.endsWith(".json"));
+    
+    if (idlFiles.length === 0) {
+      throw new Error("No IDL files found");
+    }
+
+    const idlPath = path.join(idlDir, idlFiles[0]);
+    const idl = JSON.parse(fs.readFileSync(idlPath, "utf-8"));
+    const programName = path.basename(idlFiles[0], ".json");
+
+    return { idl, programName };
+  }
+
+  private async handleExistingTests(): Promise<void> {
+    if (this.existingTests.length === 0) return;
+
+    const choice = await this.askUser();
+
+    if (choice === "delete") {
+      this.existingTests.forEach(f => {
+        try {
+          fs.unlinkSync(f);
+        } catch {}
+      });
+      console.log("Cleaned up old tests");
+    }
+  }
+
+  private async askUser(): Promise<"continue" | "delete"> {
+    if (this.forceMode) return "delete";
+
+    console.log("Existing tests found:");
+    this.existingTests.forEach(f => console.log(`  ${path.relative(process.cwd(), f)}`));
+
+    console.log("\n1) Keep  2) Delete (recommended)");
+
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    return new Promise(resolve => {
+      rl.question("Choice: ", ans => {
+        rl.close();
+        resolve(ans.trim() === "2" ? "delete" : "continue");
+      });
+    });
+  }
+
+  private writeTestFile(programName: string, testCode: string): void {
+    fs.mkdirSync(this.soltestDir, { recursive: true });
+    const outPath = path.join(this.soltestDir, `${programName}.test.ts`);
+    fs.writeFileSync(outPath, testCode);
+    console.log(`\nGenerated: ${path.relative(process.cwd(), outPath)}`);
+  }
+}
+
+// Entry
+const [, , ...args] = process.argv;
+new CLI().run(args);
