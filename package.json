@@ -1,6 +1,6 @@
 {
   "name": "soltest",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "bin": {
     "soltest": "./bin/soltest.js"
   },
