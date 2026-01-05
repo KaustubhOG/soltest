@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![npm version](https://badge.fury.io/js/soltest.svg)](https://www.npmjs.com/package/soltest)
 
-soltest reads your Anchor IDL and generates working, runnable integration tests in TypeScript for Solana programs—without writing tests by hand. It's designed to lower the barrier to entry for Solana development and establish testing best practices from day one.
+soltest reads your Anchor IDL and generates working, runnable integration tests in TypeScript for Solana programs. It aims to lower the barrier to entry for Solana development and establish testing best practices from day one.
 
 ---
 
@@ -20,7 +20,8 @@ soltest reads your Anchor IDL and generates working, runnable integration tests 
 - [Example Output](#example-output)
 - [Project Architecture](#project-architecture)
 - [Supported Program Types](#supported-program-types)
-- [Limitations & Roadmap](#limitations--roadmap)
+- [Known Limitations](#known-limitations)
+- [Development Roadmap](#development-roadmap)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -28,22 +29,22 @@ soltest reads your Anchor IDL and generates working, runnable integration tests 
 
 ## The Problem
 
-Writing comprehensive tests for Anchor programs is one of the **biggest barriers** for new Solana developers:
+Writing comprehensive tests for Anchor programs presents significant challenges for Solana developers:
 
 | Challenge | Impact |
 |-----------|--------|
-| **PDA Derivation** | Hard to get seeds and bumps right, leading to runtime failures |
-| **Instruction Ordering** | Setup → Action → Assert flows are non-obvious for beginners |
-| **Signer Validation** | Testing authorization logic requires deep understanding of accounts |
+| **PDA Derivation** | Incorrect seed and bump derivation leads to runtime failures |
+| **Instruction Ordering** | Setup, action, and assertion flows are non-obvious for beginners |
+| **Signer Validation** | Testing authorization logic requires deep understanding of account relationships |
 | **Boilerplate Overhead** | Repetitive account setup discourages thorough testing |
 
-**The Result:**
-- 🚫 Many developers skip testing entirely
-- 📋 Copy-pasted test snippets that don't match their program
-- 😞 Early frustration leads to abandoning projects
-- 🐛 Production deployments with untested edge cases
+**Common Results:**
+- Many developers skip testing entirely
+- Copy-pasted test snippets that don't match their program
+- Early frustration during onboarding
+- Production deployments with untested edge cases
 
-**soltest eliminates these blockers by automatically generating correct, runnable tests from your compiled program.**
+soltest addresses these issues by automatically generating correct, runnable tests from compiled programs.
 
 ---
 
@@ -51,9 +52,9 @@ Writing comprehensive tests for Anchor programs is one of the **biggest barriers
 
 soltest analyzes your Anchor IDL and generates three categories of tests:
 
-1. **✅ Success Path Tests** – Verify instructions execute correctly with valid inputs
-2. **❌ Authorization Tests** – Ensure unauthorized signers are rejected
-3. **⚠️ Edge Case Tests** – Test boundary conditions and error handling
+1. **Success Path Tests** – Verify instructions execute correctly with valid inputs
+2. **Authorization Tests** – Ensure unauthorized signers are rejected
+3. **Edge Case Tests** – Test boundary conditions and error handling
 
 ### Key Principles
 
@@ -66,32 +67,32 @@ soltest analyzes your Anchor IDL and generates three categories of tests:
 
 ## Features
 
-### ✨ Core Capabilities
+### Core Capabilities
 
-- 🔍 **Automatic IDL Analysis** – Parses instructions, accounts, and constraints
-- 🧩 **Smart PDA Derivation** – Correctly handles seeds from multiple sources
-- 🔄 **Flow Detection** – Identifies CRUD patterns (Create/Update/Delete)
-- 📝 **TypeScript Generation** – Produces clean, readable test files
-- 🎯 **Account Resolution** – Automatically resolves account relationships
-- ⚡ **Zero Configuration** – Works out of the box with `anchor build`
+- **Automatic IDL Analysis** – Parses instructions, accounts, and constraints
+- **Smart PDA Derivation** – Correctly handles seeds from multiple sources
+- **Flow Detection** – Identifies CRUD patterns (Create/Update/Delete)
+- **TypeScript Generation** – Produces clean, readable test files
+- **Account Resolution** – Automatically resolves account relationships
+- **Zero Configuration** – Works out of the box with `anchor build`
 
-### 🎨 Generated Test Types
+### Generated Test Types
 
 ```typescript
 // Success tests
-✅ Creates accounts with valid parameters
-✅ Updates state correctly
-✅ Deletes accounts and recovers rent
+✓ Creates accounts with valid parameters
+✓ Updates state correctly
+✓ Deletes accounts and recovers rent
 
 // Authorization tests  
-❌ Rejects unauthorized signers
-❌ Validates owner constraints
-❌ Enforces account ownership
+✗ Rejects unauthorized signers
+✗ Validates owner constraints
+✗ Enforces account ownership
 
 // Edge case tests
-⚠️ Handles empty strings
-⚠️ Tests maximum value boundaries
-⚠️ Validates required fields
+⚠ Handles empty strings
+⚠ Tests maximum value boundaries
+⚠ Validates required fields
 ```
 
 ---
@@ -112,15 +113,15 @@ npx soltest generate
 
 ### Requirements
 
-- Node.js ≥ 16
-- Anchor CLI ≥ 0.28.0
+- Node.js >= 16
+- Anchor CLI >= 0.28.0
 - A compiled Anchor program with IDL
 
 ---
 
 ## Quick Start
 
-### 1️⃣ Build Your Anchor Program
+### 1. Build Your Anchor Program
 
 ```bash
 anchor build
@@ -128,7 +129,7 @@ anchor build
 
 This generates `target/idl/<program_name>.json`
 
-### 2️⃣ Generate Tests
+### 2. Generate Tests
 
 ```bash
 soltest generate
@@ -146,13 +147,13 @@ npx soltest generate
 - Generates tests in `tests/soltest/<program_name>.test.ts`
 - Prompts before overwriting existing tests
 
-### 3️⃣ Run Tests
+### 3. Run Tests
 
 ```bash
 anchor test
 ```
 
-**That's it.** Your program now has comprehensive test coverage.
+Your program now has comprehensive test coverage.
 
 ---
 
@@ -232,7 +233,6 @@ it("successfully creates a journal entry", async () => {
     })
     .rpc();
 
-  // Future: State assertions will be added here
   const account = await program.account.journalEntry.fetch(journalEntryPda);
   assert.equal(account.title, title);
 });
@@ -325,8 +325,8 @@ src/
 
 ### Key Design Decisions
 
-| Module | Responsibility | Why |
-|--------|----------------|-----|
+| Module | Responsibility | Rationale |
+|--------|----------------|-----------|
 | **idl-reader** | Parse and validate IDL JSON | Single source of truth for program structure |
 | **parser** | Detect CRUD patterns and relationships | Enables smart test generation without hardcoding |
 | **template** | Generate TypeScript test code | Modular templates support future customization |
@@ -336,111 +336,101 @@ src/
 
 ## Supported Program Types
 
-### ✅ Fully Supported (MVP)
+### Fully Supported
 
 | Program Type | Example Use Case | Test Coverage |
 |--------------|------------------|---------------|
-| **Simple PDA** | Favorites, profiles | ✅ Create, Update |
-| **CRUD Apps** | To-do lists, notes | ✅ Create, Read, Update, Delete |
-| **Voting Systems** | Polls, proposals | ✅ Initialize, Vote, Close |
-| **Counter Programs** | Analytics, metrics | ✅ Initialize, Increment, Reset |
+| **Simple PDA** | Favorites, profiles | Create, Update |
+| **CRUD Apps** | To-do lists, notes | Create, Read, Update, Delete |
+| **Voting Systems** | Polls, proposals (single-instruction) | Initialize, Vote, Close |
+| **Counter Programs** | Analytics, metrics | Initialize, Increment, Reset |
 
-### 🚧 Partial Support
+### Partial Support
 
 - **Multi-PDA Programs**: Basic support (manual hints may be needed)
-- **CPI-Heavy Programs**: Works for simple cases (escrow planned for v2)
+- **CPI-Heavy Programs**: Works for simple cases
 
-### 📋 Tested Examples
+### Tested Examples
 
 soltest has been verified on real-world Anchor programs:
 
-- ✅ [Favorites Program](https://github.com/KaustubhOG/Solana_Projects-/blob/main/favorites/programs/favorites/src/lib.rs)
-- ✅ [Journal CRUD App](https://github.com/KaustubhOG/Solana_Projects-/blob/main/crud-app/programs/crud-app/src/lib.rs)
-- ✅ [Voting Program](https://github.com/KaustubhOG/Solana_Projects-/blob/main/voting_program/programs/voting_program/src/lib.rs)
+- [Favorites Program](https://github.com/KaustubhOG/Solana_Projects-/blob/main/favorites/programs/favorites/src/lib.rs)
+- [Journal CRUD App](https://github.com/KaustubhOG/Solana_Projects-/blob/main/crud-app/programs/crud-app/src/lib.rs)
+- [Voting Program](https://github.com/KaustubhOG/Solana_Projects-/blob/main/voting_program/programs/voting_program/src/lib.rs) (single-instruction tests pass)
 
-All generated tests pass with `anchor test` on localnet.
-
----
-
-## Limitations & Roadmap
-
-### Current Limitations (Acceptable for MVP)
-
-| Limitation | Impact | Mitigation |
-|------------|--------|------------|
-| **Complex CPIs** | Escrow/vault programs need manual setup | Post-MVP: CPI graph analysis |
-| **State Assertions** | Tests verify execution, not state changes | Post-MVP: Auto-generate `assert` calls |
-| **Custom Ordering** | Multi-step flows use heuristics | Post-MVP: Configurable instruction ordering |
-
-These are **explicit design choices** for MVP scope, not bugs.
-
-### Roadmap
-
-#### 🎯 Version 1.1 (Q2 2024)
-- [ ] State assertion generation
-- [ ] Enhanced error message parsing
-- [ ] Support for custom account types
-
-#### 🎯 Version 2.0 (Q3 2024)
-- [ ] Escrow/vault/CPI-heavy programs
-- [ ] Plugin system for custom templates
-- [ ] Interactive mode for instruction ordering
-- [ ] Program-type presets (marketplace, AMM, escrow)
-
-#### 🎯 Version 3.0 (Q4 2024)
-- [ ] Integration with Anchor test framework v0.30+
-- [ ] Visual test coverage reports
-- [ ] Mutation testing support
+Generated tests pass with `anchor test` on localnet for supported program types.
 
 ---
 
-## Why This Deserves Grant Support
+## Known Limitations
 
-### 🎯 Impact on Solana Ecosystem
+### Current Limitations
 
-1. **Lowers Barrier to Entry**
-   - Testing is the #1 blocker for new developers
-   - soltest removes this friction entirely
+| Limitation | Impact | Status |
+|------------|--------|--------|
+| **Multi-Instruction Sequences** | Programs requiring multiple instructions in sequence (e.g., initialize then vote) may have test failures | Under investigation |
+| **Complex CPIs** | Escrow/vault programs need manual setup | Future enhancement |
+| **State Assertions** | Tests verify execution, not all state changes | Future enhancement |
+| **Custom Instruction Ordering** | Multi-step flows use heuristics | Future enhancement |
 
-2. **Establishes Best Practices**
-   - Encourages testing from day one
-   - Promotes security-first development culture
+**Note on Voting Program**: While single-instruction tests pass successfully, multi-instruction test sequences currently fail. This is a known issue being addressed in future development.
 
-3. **Accelerates Development**
-   - Saves hours of boilerplate writing
-   - Lets developers focus on business logic
+---
 
-4. **Improves Code Quality**
-   - Generated tests catch bugs early
-   - Reduces production incidents
+## Development Roadmap
 
-### 📊 Measurable Goals
+The following development phases are planned, subject to available resources and community feedback:
 
-| Metric | Target (6 months) | Impact |
-|--------|-------------------|--------|
-| **Weekly Downloads** | 500+ | Adoption by active Anchor developers |
-| **GitHub Stars** | 250+ | Community validation |
-| **Programs Tested** | 1,000+ | Real-world usage |
-| **Reduced Test Time** | 80% | Developer productivity |
+### Phase 1: Core Improvements
+- State assertion generation
+- Enhanced error message parsing
+- Support for custom account types
+- Fix multi-instruction test sequencing
 
-### 🛠️ Technical Merit
+### Phase 2: Advanced Features
+- Escrow/vault/CPI-heavy program support
+- Plugin system for custom templates
+- Interactive mode for instruction ordering
+- Program-type presets (marketplace, AMM, escrow)
+
+### Phase 3: Ecosystem Integration
+- Integration with Anchor test framework updates
+- Visual test coverage reports
+- Mutation testing support
+
+**Note**: Roadmap priorities may be adjusted based on community feedback and ecosystem needs.
+
+---
+
+## Grant Proposal Context
+
+### Impact on Solana Ecosystem
+
+**Lowering Barrier to Entry**
+Testing remains a significant blocker for new developers. soltest removes this friction by automating test generation, allowing developers to focus on program logic rather than test boilerplate.
+
+**Establishing Best Practices**
+By generating tests automatically, soltest encourages testing from day one and promotes security-first development culture within the Solana ecosystem.
+
+**Accelerating Development**
+Automated test generation saves hours of boilerplate writing and helps developers catch bugs early in the development cycle.
+
+### Technical Merit
 
 - **No Mocking**: Tests run on real chain (localnet/devnet)
 - **IDL-Driven**: Future-proof as Anchor evolves
 - **Modular Design**: Easy to extend and customize
-- **Zero Config**: Works out of the box
+- **Zero Configuration**: Works out of the box
 
-### 🌱 Ecosystem Alignment
+### Ecosystem Alignment
 
-- Complements Anchor's mission to simplify Solana development
-- Reduces developer churn during onboarding
-- Creates a culture of tested, production-ready code
+soltest complements Anchor's mission to simplify Solana development and helps reduce developer churn during onboarding. The tool aims to create a culture of tested, production-ready code in the Solana ecosystem.
 
 ---
 
 ## Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ### Development Setup
 
@@ -461,17 +451,17 @@ npm test
 
 ### Areas for Contribution
 
-- 🐛 Bug reports and fixes
-- 📚 Documentation improvements
-- ✨ New program type support
-- 🎨 Template enhancements
-- 🧪 Test coverage expansion
+- Bug reports and fixes
+- Documentation improvements
+- New program type support
+- Template enhancements
+- Test coverage expansion
 
 ---
 
 ## License
 
-MIT © [Kaustubh Ogale](https://github.com/KaustubhOG)
+MIT © [KaustubhOG](https://github.com/KaustubhOG)
 
 ---
 
@@ -479,15 +469,11 @@ MIT © [Kaustubh Ogale](https://github.com/KaustubhOG)
 
 - **GitHub**: [github.com/KaustubhOG/soltest](https://github.com/KaustubhOG/soltest)
 - **npm**: [npmjs.com/package/soltest](https://www.npmjs.com/package/soltest)
-- **Documentation**: [Coming Soon]
+- **Documentation**: Coming Soon
 - **Issues**: [github.com/KaustubhOG/soltest/issues](https://github.com/KaustubhOG/soltest/issues)
 
 ---
 
-<div align="center">
+**Built for the Solana developer community**
 
-**Built with ❤️ for the Solana developer community**
-
-[⭐ Star on GitHub](https://github.com/KaustubhOG/soltest) | [📦 Install via npm](https://www.npmjs.com/package/soltest) | [🐛 Report Bug](https://github.com/KaustubhOG/soltest/issues)
-
-</div>
+[Star on GitHub](https://github.com/KaustubhOG/soltest) | [Install via npm](https://www.npmjs.com/package/soltest) | [Report Bug](https://github.com/KaustubhOG/soltest/issues)
