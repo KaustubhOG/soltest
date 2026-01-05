@@ -354,9 +354,9 @@ src/
 
 soltest has been verified on real-world Anchor programs:
 
-- ✅ [Favorites Program](https://github.com/solana-developers/program-examples)
-- ✅ [Journal CRUD App](https://github.com/solana-developers/program-examples)
-- ✅ [Voting Program](https://github.com/solana-developers/program-examples)
+- ✅ [Favorites Program](https://github.com/KaustubhOG/Solana_Projects-/blob/main/favorites/programs/favorites/src/lib.rs)
+- ✅ [Journal CRUD App](https://github.com/KaustubhOG/Solana_Projects-/blob/main/crud-app/programs/crud-app/src/lib.rs)
+- ✅ [Voting Program](https://github.com/KaustubhOG/Solana_Projects-/blob/main/voting_program/programs/voting_program/src/lib.rs)
 
 All generated tests pass with `anchor test` on localnet.
 
