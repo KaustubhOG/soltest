@@ -89,10 +89,7 @@ soltest analyzes your Anchor IDL and generates three categories of tests:
 ✗ Validates owner constraints
 ✗ Enforces account ownership
 
-// Edge case tests
-⚠ Handles empty strings
-⚠ Tests maximum value boundaries
-⚠ Validates required fields
+
 ```
 
 ---
