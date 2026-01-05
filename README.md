@@ -159,7 +159,14 @@ Your program now has comprehensive test coverage.
 
 ## How It Works
 
+
+
+
 ### Architecture Overview
+
+
+https://github.com/user-attachments/assets/9c3d5730-46b8-4cdd-a4a1-8ced68b2d968
+
 
 ```
 ┌─────────────────┐
